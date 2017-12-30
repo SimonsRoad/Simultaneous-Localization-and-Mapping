@@ -1,0 +1,144 @@
+function [xEst,PEst,MappedLandFeatures] = EKFSLAM(rob,pos,D,b,srange,sangle,P, Dtheta, Rb, bd,S,iFeature,MappedLandFeatures)
+global xVehicleTrue;
+global LandFeatures;
+global xOdomLast;
+global UTrue;
+global LaserSensorSettings;
+
+% Miscelaneous inputs
+V = D(1);
+z = [];
+
+% Setting of the sensors specs
+LaserSensorSettings.Bearing = 5; % Degrees
+LaserSensorSettings.Range = 100; %cm 
+
+% Number of landfeatures to add to map
+nLandFeatures =6;
+
+% Initial position of the vehicle
+xVehicleTrue = rob'; % start position (x, y, theta)
+
+% Set the initial conditions of the filter
+xEst = pos; % already a columm vector
+PEst = P; % start with an medium covar ( Atention EKF need an good initialization)
+
+% Make some space to save the Landmarks detected (arraylist (x,y)
+
+% Additive noise to be added at the observation
+obsNoise = randn(2,1);
+
+% Standart deviation errors added to control
+UTrue = diag([0.01,0.01,1.5*pi/180]).^2;
+
+% Standard deviation errors regarding observation
+RTrue = diag([1.1,5*pi/180]).^2;
+
+
+% Aditive factor for control estimation and noise
+UEst = 2.0*UTrue;
+REst = 2.0*RTrue;
+
+% All Setup and ready to go
+% Extract first odometry for predict
+CtrlNoise = randn(3,1); % some random control noise to be added ( note change to gaussian)
+xOdomLast = GetOdometry(CtrlNoise);
+    
+u = [V;V;Dtheta];
+
+% extract the two compoments of the estimation ( Vehicle and
+% landfeatures
+% get vehicle estimation
+xVehicle = xEst(1:3); % estimated only the part for the vehicle
+% get landferatures estimation
+xMap = xEst(4:end); % Landfeatures estimation are the rest ones
+    
+%do prediction (the following is simply the result of multiplying 
+%out block form of jacobians)     
+xVehiclePred = tcomp(xVehicle,u); % estimation is regarding current and control vector
+% covariance for vehicle
+%J2 is just an simple rotation matrix over x
+% just need to change to the cnematic model and speeds
+    
+% Change this!!!
+PPredvv = J1(xVehicle,u)* PEst(1:3,1:3) *J1(xVehicle,u)' + J2(xVehicle,u)* UEst * J2(xVehicle,u)';
+% vehicle/ landmarks,
+PPredvm = J1(xVehicle,u)*PEst(1:3,4:end);
+% For the rest just extract (landfeatures
+PPredmm = PEst(4:end,4:end);
+    
+% agregates robot prediction and beacons
+xPred = [xVehiclePred;xMap];
+%     % Compose the covariance matrix
+%          Ppred = |Pvv Pvm
+%                  |Pvm' Pmm
+PPred = [PPredvv PPredvm; 
+        PPredvm' PPredmm];
+
+ObsNoise =randn(2,1);
+%[z,iFeature] = GetObservation(ObsNoise,RTrue);
+
+if size(iFeature) == 0
+    z =[];
+else
+        z = DoObservationModel(xVehicleTrue,b(end,:)')+sqrt(RTrue)*ObsNoise;
+end
+if(~isempty(z)) %if found any beacon
+    if( ~isnan(MappedLandFeatures(iFeature(end),1))) %if beacon already found
+        %predict observation: find out where it is in state vector
+        FeatureIndex = MappedLandFeatures(iFeature(end),1);
+        % Extract feature values in state vector
+        xFeature = xPred(FeatureIndex:FeatureIndex+1);
+
+        % predict the observation
+        zPred = DoObservationModel(xVehicle,xFeature);
+
+        % get observation Jacobians
+        [jHxv,jHxf] = GetObsJacs(xVehicle,xFeature);
+
+        % fill in state jacobian
+        jH = zeros(2,length(xEst));
+        jH(:,FeatureIndex:FeatureIndex+1) = jHxf;
+        jH(:,1:3) = jHxv;
+
+        %do Kalman update:
+        % check for inovation (here we can use the validation gate
+                
+
+        Innov = z-zPred;
+        % angles have always to be checked only betwewn 0 an 2Pi
+        Innov(2) = AngleWrapping(Innov(2));
+
+        S = jH*PPred*jH'+REst;
+        W = PPred*jH'*inv(S); 
+        xEst = xPred+ W*Innov;
+
+        PEst = PPred-W*S*W';
+
+        %ensure P remains symmetric
+        PEst = 0.5*(PEst+PEst'); else
+                %New Beacon  
+                % extract length of the current tracking landmarks
+                nStates = length(xEst); 
+                xFeature = xVehicle(1:2)+ [z(1)*cos(z(2)+xVehicle(3));z(1)*sin(z(2)+xVehicle(3))];
+                xEst = [xEst;xFeature]; %add to state vector estimated
+                
+                % compute jacobians regaing feature and observation 
+                [jGxv, jGz] = GetNewFeatureJacs(xVehicle,z); 
+
+                M = [eye(nStates), zeros(nStates,2);% no use jacobian w.r.t vehicle
+                    jGxv zeros(2,nStates-3)  , jGz];
+                %PEst
+                %size(M)
+                %size(blkdiag(PEst,REst))
+                PEst = M*blkdiag(PEst,REst)*M';
+
+                MappedLandFeatures(iFeature(end),:) = [length(xEst)-1, length(xEst)];
+            end
+    end
+else
+%nothing new found lets procced refreshing the values for next run
+xEst = xPred;
+PESt = PPred;
+end
+end
